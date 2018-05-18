@@ -1,0 +1,417 @@
+---
+title: 'Kickstarted?: Predicting the Success of Kickstarter Projects Using Machine Learning'
+author: "Joshua Davis"
+date: "May 18, 2018"
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    number_sections: TRUE
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+#Introduction
+
+We will be using machine learning in an effort to predict the success or failure of Kickstarter projects. The general question we hope to answer is: Given certain factors, such as goal (how much money the Kickstarter project wants to raise) and duration (for how long can people back the project), can we predict if the project will be successful or not? We will define success later. We will also be doing some exploratory data analysis and visualization throughout. We will train and/or analyze multiple machine learning models, tune hyperparameters, and compare their results.
+
+Our tasks are as follows:
+
+1. Load our data
+2. Tidy our data
+3. Perform some EDA and visualization
+4. Train and analyze our machine learning models
+
+##Load Libraries
+
+Below you can see the libraries we used to perform our data analysis...
+
+```{r load libraries}
+library(lubridate)
+library(dplyr)
+library(knitr)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(purrr)
+library(tidyr)
+library(broom)
+library(ROCR)
+```
+
+#Data
+
+Below we load our primary table obtained from https://www.kaggle.com/kemical/kickstarter-projects. The data originates from https://www.kickstarter.com. Kickstarter is one of many 'crowdfunding' sites where entrepreneurs can fund projects with the help of other people. 
+
+*Also, please excuse any profanity in the names of projects as I did not create them.*
+
+##Loading
+
+```{r primary table}
+projects <- read.csv("ks-projects-201801.csv", stringsAsFactors = FALSE)
+
+str(projects)
+```
+
+Most of the attributes do not need an explaination. It should be noted that the 'goal', 'pledged' and 'usd.pledged' variables will be dropped in tidying because of differences in currency and currency conversion. Attributes usd_pledged_real and usd_goal_real are conversions of pledged and goal by the authors of the dataset using [Fixer.io API](https://fixer.io/) in order to have accurate and uniform conversions.
+
+##Tidying
+
+Our dataset is a mostly "tidy" dataset. However, we must still perform some transformations for our purposes.
+
+As menioned in the loading section, we must drop attributes 'goal', 'pledged' and 'usd.pledged'. We must also convert 'launched' and 'deadline' into datetime, as well as add a variable 'duration' that equals 'deadline' - 'launched'. Additionally, we will convert categorical attributes into factors. For simplicity we will also turn this into a binary classification problem (i.e. 'state' equals '0' or '1'). It may be interesting to explore muticlass prediction later on if time permits.
+
+###Drop Unused Attributes
+
+We start our transformations by dropping 'goal', 'pledged' and 'usd.pledged'.
+
+```{r drop columns}
+projects <- projects %>%
+  select(-goal, -pledged, -usd.pledged)
+```
+
+###Conversions
+
+Next we will make our conversions for time and categorical attributes.
+
+```{r convert}
+projects$launched <- ymd_hms(projects$launched)
+projects$deadline <- ymd(projects$deadline)
+
+projects$main_category <- as.factor(projects$main_category)
+projects$category <- as.factor(projects$category)
+projects$currency <- as.factor(projects$currency)
+projects$country <- as.factor(projects$country)
+#projects$state should also be a factor, but we address this in the next subsection.
+```
+
+###Duration & Label Translation
+
+Now lets add an attribute 'duration' that equals 'deadline' - 'launched'
+
+```{r duration}
+projects <- projects %>%
+  mutate(duration = difftime(deadline, launched, units = "secs")) %>%
+  transform(duration = as.numeric(duration))
+```
+
+Finally we take a look at the state attribute...
+
+```{r state}
+levels(as.factor(projects$state))
+```
+
+This means we must come up with a measure of success ('1') and failure ('0') ourselves. We will define success as 'usd_pledged_real' - 'usd_goal_real' >= 0. Translation below...
+
+```{r label}
+projects <- projects %>%
+  mutate(state = ifelse(usd_pledged_real - usd_goal_real >= 0, 1, 0))
+
+projects$state <- as.factor(projects$state)
+
+str(projects)
+```
+
+This completes our tidying. 
+
+Pragmatically speaking, a project that reaches its goal but does not deliver their product, or is otherwise cancelled / delayed et cetra could be considered a failure to the consumer. This is where one could deploy a model amenable to a multiclass setting. I have deemed our data insufficent to make accurate predictions in such a setting. One can hope for more information on the project teams, such as prior successes. This consideration is the reason for simplifying to a binary setting. Therefore, our prediction ability would be mainly useful to other project teams who are looking to reach a certain goal for their Kickstarter projects.
+
+#Exploratory Data Analysis and Visualization
+
+Since our ultimate goal is prediction using machine learning models, it would be helpful to try and get a sense of what attributes may have a large impact on predicting '1' (success) or '0' (failure).
+
+##Setup
+
+We will start by partitioning our main table into two intermediate tables, one for successes and one for failures. This way we can perform EDA separately and easily.
+
+```{r partition}
+successes <- projects %>%
+  filter(state == 1)
+
+failures <- projects %>%
+  filter(state == 0)
+```
+```{r view partition}
+kable(head(successes))
+kable(head(failures))
+```
+
+###One Quick Note
+
+```{r note}
+nrow(failures) / nrow(successes)
+```
+
+This is the ratio of failures to successes. The failures well outnumber the successes, which could be an indicator that being successful is a rare event. One should keep this in mind when viewing the graphs in this section. It will become particularly important in the machine learning section when we must decide how to evaluate our models.
+
+##Comparing Attributes
+
+###Main Category
+
+Lets first take a look at what category of project has the most successes and what category has the most failures. We look at main category here because R's randomForest cannot handle categorical variables with more than 53 categories (i.e. the 'category' attribute).
+
+```{r main_cat_s}
+successes %>%
+  ggplot(aes(x = main_category)) +
+  geom_histogram(stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r main_cat_f}
+failures %>%
+  ggplot(aes(x = main_category)) +
+  geom_histogram(stat = "count") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Keeping in mind that failures outnumber successes by a factor of ~1.7, music stands out as a particularly successful category. Lets check music's ratio...
+
+```{r music}
+nrow(filter(failures, main_category == "Music")) /
+  nrow(filter(successes, main_category == "Music"))
+```
+
+As opposed to many other categories, music has almost a 1 to 1 ratio of failures to successes.
+
+###Goal
+
+One might assume that projects with a prohibitivly high goal would be unlikely to be successful. Lets start by seeing if we can spot a difference...
+
+```{r goal_s}
+successes %>%
+  ggplot(aes(x = usd_goal_real)) +
+  geom_histogram()
+```
+
+It is not easy to see the distribution of goals for successes here. A simple transformation can fix this...
+
+```{r goal_st}
+successes %>%
+  mutate(min_goal = min(usd_goal_real)) %>%
+  mutate(log_goal = log(usd_goal_real - min_goal)) %>%
+  ggplot(aes(x = log_goal)) +
+  geom_histogram()
+```
+
+Much better.
+
+Now lets take a look at the failures (after performing the same transformation as we did for successes)...
+
+```{r goal_ft}
+failures %>%
+  mutate(min_goal = min(usd_goal_real)) %>%
+  mutate(log_goal = log(usd_goal_real - min_goal)) %>%
+  ggplot(aes(x = log_goal)) +
+  geom_histogram()
+```
+
+(The min_goal happens to be the same for both successes and failures.)
+
+The distributions seem fairly similar. For good measure lets take a look at them side by side...
+
+```{r goal_plot}
+projects %>%
+  mutate(min_goal = min(usd_goal_real)) %>%
+  mutate(log_goal = log(usd_goal_real - min_goal)) %>%
+  ggplot(aes(x = state, y = log_goal)) +
+  geom_boxplot()
+```
+
+While failures definitly have higher goals on average, it seems premature to conclude that the goal will have a significant affect on the success of a project.
+
+###Duration
+
+In the same vain as goal, it seems reasonable to assume that projects with a longer duration will be more likely to be successful. We will apply the same log transformation as we did for goal for the same reason...
+
+```{r duration_st}
+successes %>%
+  mutate(min_duration = min(duration)) %>%
+  mutate(log_duration = log(duration - min_duration)) %>%
+  ggplot(aes(x = log_duration)) +
+  geom_histogram()
+```
+
+Now failures...
+
+```{r duration_ft}
+failures %>%
+  mutate(min_duration = min(duration)) %>%
+  mutate(log_duration = log(duration - min_duration)) %>%
+  ggplot(aes(x = log_duration)) +
+  geom_histogram()
+```
+
+(The min_durations are not equal this time, but we will use the projects data frame next.)
+
+Our assumption that a longer duration will make a project more likely to be successful may also be false. Lets view the boxplots as before...
+
+```{r duration_plot}
+projects %>%
+  mutate(min_goal = min(usd_goal_real)) %>%
+  mutate(log_goal = log(usd_goal_real - min_goal)) %>%
+  ggplot(aes(x = state, y = log_goal)) +
+  geom_boxplot()
+```
+
+##Intermediate Results
+
+So at this point we have 2 possibly related things to consider:
+
+1. Successes may be a rare event.
+2. Because there is little discernable difference in the distribution of attribute values for successes and failures, prediction may be difficult.
+
+For #2, we hope our machine learning model can combine attributes in such a way as to make better inferences than we can.
+
+#Machine Learning and Prediction
+
+Now it is time to train our machine learning models. Because of the difficulty in spotting a connection between any one attribute and the success (or failure) of a project in the previous section, we will train a logistic regression model to hypothesis test for relationships. We will then train a random forest. We will perform cross validation to assess our forest's performance and tune hyperparameters. Finally, we visualize what sort of improvement we can achieve (if any) with our tuned hyperparameters using an AUROC plot. Finally we will test to see if one model is better than another.
+
+##Logistic Regression
+
+##Random Forest
+
+Adapted from example [here](http://www.hcbravo.org/IntroDataSci/projects/project3/classification_zillow/) since that is the only way I know how to do random forests in R.
+
+###Split Training/Test Data
+
+We will start by randomly sampling out 30% of our data because of the memory limitations of R's randomForest library. We will then build a random forest using an 80/20 train/test data split on this subset. This split is pretty standard, but can be different if you have good reason to split differently.
+
+```{r subset}
+set.seed(1234)
+
+subset <- projects %>%
+  sample_frac(.3)
+```
+
+```{r train/test}
+test_random_forest_df <- subset %>%
+  group_by(state) %>%
+  sample_frac(.2) %>%
+  ungroup()
+
+train_random_forest_df <- subset %>%
+  anti_join(test_random_forest_df, by="ID")
+```
+
+###Training
+
+Now that we have our training set we can train the model...
+
+```{r training}
+rf <- randomForest(state ~ ., 
+                   data = train_random_forest_df %>% 
+                     select(-ID, -name, -category, -deadline, -launched))
+
+rf
+```
+
+###Testing
+
+Time to make predictions!
+
+```{r prediction}
+test_predictions <- predict(rf, 
+                            newdata = test_random_forest_df %>% 
+                              select(-ID, -name, -category, -deadline, -launched))
+```
+
+And lets check our performance on the test set...
+
+```{r conf_matrix}
+table(pred = test_predictions, observed = test_random_forest_df$state)
+```
+
+Our error rate is 0.33%! Pretty fantastic!
+
+###Cross-Validation
+
+We will now perform 10-fold cross-validation to compare our large randomForest (default 500 trees), with a moderately sized random forest (100 trees). This process can be automated to test different fold values (e.g. 5 instead of 10), and test differently sized forests. One could then plot the different hyperparameter values against test accuracy to choose the best values (That would be how one should really tune hyperparameters. But for the purposes of this tutorial, this test will give us an idea of how performance may or may not be plateauing after reaching a certain hyperparameter value.)
+
+```{r cross_valid}
+results_df <- createFolds(subset$state, k = 10) %>%
+  imap(function(test_indices, fold_number) {
+    
+    train_df <- subset %>%
+      select(-ID, -name, -category, -deadline, -launched) %>%
+      slice(-test_indices)
+    
+    test_df <- subset %>%
+      select(-ID, -name, -category, -deadline, -launched) %>%
+      slice(test_indices)
+    
+    rf1 <- randomForest(state ~ ., data = train_df, ntree = 500)
+    rf2 <- randomForest(state ~ ., data = train_df, ntree = 100)
+    
+    test_df %>%
+      select(observed_label = state) %>%
+      mutate(fold = fold_number) %>%
+      mutate(prob_positive_rf1 = predict(rf1, newdata = test_df, type = "prob")[, "1"]) %>%
+      mutate(predicted_label_rf1 = ifelse(prob_positive_rf1 > 0.5, 1, 0)) %>%
+      mutate(prob_positive_rf2 = predict(rf2, newdata = test_df, type = "prob")[, "1"]) %>%
+      mutate(predicted_label_rf2 = ifelse(prob_positive_rf2 > 0.5, 1, 0))
+    
+  }) %>%
+  reduce(bind_rows)
+
+kable(head(results_df))
+```
+
+Now to test for a difference in error rate...
+
+```{r error_rate}
+results_df %>%
+  mutate(error_rf1 = observed_label != predicted_label_rf1,
+         error_rf2 = observed_label != predicted_label_rf2) %>%
+  group_by(fold) %>%
+  summarize(big_rf = mean(error_rf1), small_rf = mean(error_rf2)) %>%
+  gather(model, error, -fold) %>%
+  lm(error ~ model, data = .) %>%
+  tidy()
+```
+
+There is not a statistically cignificant difference in error rate between the two random forests. This means that our performance starts to plateau on or before the size becomes 100.
+
+###Cross-Validation cont. (AUROC)
+
+Now lets visualize the difference...
+
+```{r AUROC}
+labels <- split(results_df$observed_label, results_df$fold)
+
+predictions_rf1 <- split(results_df$prob_positive_rf1, results_df$fold) %>% prediction(labels)
+
+predictions_rf2 <- split(results_df$prob_positive_rf2, results_df$fold) %>% prediction(labels)
+
+mean_auc_rf1 <- predictions_rf1 %>%
+  performance(measure = "auc") %>%
+  slot("y.values") %>% unlist() %>% 
+  mean()
+
+mean_auc_rf2 <- predictions_rf2 %>%
+  performance(measure = "auc") %>%
+  slot("y.values") %>% unlist() %>% 
+  mean()
+
+predictions_rf1 %>%
+  performance(measure = "tpr", x.measure = "fpr") %>%
+  plot(avg = "threshold", col = "orange", lwd = 2)
+
+predictions_rf2 %>%
+  performance(measure = "tpr", x.measure = "fpr") %>%
+  plot(avg = "threshold", col = "blue", lwd = 2, add = TRUE)
+
+legend("bottomright",
+       legend = paste(c("big", "small"), "rf, AUC:", round(c(mean_auc_rf1, mean_auc_rf2), digits = 3)),
+       col = c("orange", "blue"))
+```
+
+Both classifiers perform astonishingly well.
+
+##Model Selection
+
+#Conclusion
+
+Sometimes it is difficult to spot connections using EDA that machine learning models can learn easily. In our case, a random forest was able to classify the training set very accurately. There are other considerations of machine learning that are not addressed in this tutorial (such as bias). For more information on machine learning see [this text](http://ciml.info/). The concepts illustrated in this tutorial can be adapted to almost any dataset. To answer our initial question, yes, we can (pretty accurately) predict the success or failure of a Kickstarter project given certain factors such as goal and duration.
