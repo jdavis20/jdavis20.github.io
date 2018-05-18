@@ -40,6 +40,7 @@ library(purrr)
 library(tidyr)
 library(broom)
 library(ROCR)
+library(cvTools)
 ```
 
 #Data
@@ -269,7 +270,32 @@ For #2, we hope our machine learning model can combine attributes in such a way 
 
 Now it is time to train our machine learning models. Because of the difficulty in spotting a connection between any one attribute and the success (or failure) of a project in the previous section, we will train a logistic regression model to hypothesis test for relationships. We will then train a random forest. We will perform cross validation to assess our forest's performance and tune hyperparameters. Finally, we visualize what sort of improvement we can achieve (if any) with our tuned hyperparameters using an AUROC plot. Finally we will test to see if one model is better than another.
 
+We will start by randomly sampling out 0.1% of our data because of the memory limitations of R's randomForest (randomForest can handle a significantly larger dataset, which we will address shortly) and logistic regression libraries. Both our logistic regression model and randomForest will be built using this subset.
+
+```{r subset}
+set.seed(1234)
+
+subset <- projects %>%
+  sample_frac(.001)
+```
+
 ##Logistic Regression
+
+We want to see if we can spot a relationship between state and the other attributes that we could not spot in our exploratory data analysis section.
+
+Below we train our logistic regression model on our subsetted data.
+
+Lets see if we can spot a relationship between state and the three previously explored attributes...
+
+```{r log_reg}
+lr <- glm(state ~ usd_goal_real + duration + main_category, data = subset, family = binomial)
+
+lr %>%
+  tidy() %>%
+  kable(digits = 5)
+```
+
+Contrary to our exploratory analysis, goal and duration are related to state while main_category is not.
 
 ##Random Forest
 
@@ -277,23 +303,18 @@ Adapted from example [here](http://www.hcbravo.org/IntroDataSci/projects/project
 
 ###Split Training/Test Data
 
-We will start by randomly sampling out 30% of our data because of the memory limitations of R's randomForest library. We will then build a random forest using an 80/20 train/test data split on this subset. This split is pretty standard, but can be different if you have good reason to split differently.
-
-```{r subset}
-set.seed(1234)
-
-subset <- projects %>%
-  sample_frac(.3)
-```
+We will then build a random forest using an 80/20 train/test data split on this subset. This split is pretty standard, but can be different if you have good reason to split differently.
 
 ```{r train/test}
+set.seed(1234)
+
 test_random_forest_df <- subset %>%
   group_by(state) %>%
   sample_frac(.2) %>%
   ungroup()
 
 train_random_forest_df <- subset %>%
-  anti_join(test_random_forest_df, by="ID")
+  anti_join(test_random_forest_df, by = "ID")
 ```
 
 ###Training
@@ -301,6 +322,8 @@ train_random_forest_df <- subset %>%
 Now that we have our training set we can train the model...
 
 ```{r training}
+set.seed(1234)
+
 rf <- randomForest(state ~ ., 
                    data = train_random_forest_df %>% 
                      select(-ID, -name, -category, -deadline, -launched))
@@ -324,14 +347,16 @@ And lets check our performance on the test set...
 table(pred = test_predictions, observed = test_random_forest_df$state)
 ```
 
-Our error rate is 0.33%! Pretty fantastic!
+Our error rate is less than 8%. Not Bad.
 
 ###Cross-Validation
 
-We will now perform 10-fold cross-validation to compare our large randomForest (default 500 trees), with a moderately sized random forest (100 trees). This process can be automated to test different fold values (e.g. 5 instead of 10), and test differently sized forests. One could then plot the different hyperparameter values against test accuracy to choose the best values (That would be how one should really tune hyperparameters. But for the purposes of this tutorial, this test will give us an idea of how performance may or may not be plateauing after reaching a certain hyperparameter value.)
+We will now perform 5-fold cross-validation (subset contains only 379 observations) to compare our large randomForest (default 500 trees), with a moderately sized random forest (100 trees). This process can be automated to test different fold values (e.g. 10 instead of 5), and test differently sized forests (Ideally trained on a larger dataset). One could then plot the different hyperparameter values against test accuracy to choose the best values (That would be how one should really tune hyperparameters. But for the purposes of this tutorial, this test will give us an idea of how performance may or may not be plateauing after reaching a certain hyperparameter value.)
 
 ```{r cross_valid}
-results_df <- createFolds(subset$state, k = 10) %>%
+set.seed(1234)
+
+results_df <- createFolds(subset$state, k = 5) %>%
   imap(function(test_indices, fold_number) {
     
     train_df <- subset %>%
@@ -408,10 +433,100 @@ legend("bottomright",
        col = c("orange", "blue"))
 ```
 
-Both classifiers perform astonishingly well.
+Both classifiers perform astonishingly well. 
+
+It turns out we don't have to consider the fact that successes may be rare (in retrospect they probably are not). But if they were, we may have wanted to adjust our classifier to increase the false positive rate at the expense of our true positive rate.
 
 ##Model Selection
 
+It should be noted that the results of this section are for purely illustrational purposes. One can train a randomForest on approx. 30% of our complete dataset and observe an error rate well below 1%. See extra section following the conclusion.
+
+We want to see if there is a statistically significant difference between the error rates of our linear regression model and our random forest model.
+
+We start by applying 5-fold cross validation to both models and generating a table of error rates...
+
+```{r model_select}
+fold_indices <- cvFolds(n = nrow(subset), K = 5)
+
+error_rates <- sapply(1:5, function(fold_index) {
+  test_indices <- which(fold_indices$which == fold_index)
+  ss <- subset %>%
+    select(-ID, -name, -category, -deadline, -launched)
+  test_set <- ss[test_indices,]
+  train_set <- ss[-test_indices,]
+  
+  lr_fit <- glm(state ~ ., data = train_set %>% select(-currency, -country), family = "binomial")
+  lr_pred <- ifelse(predict(lr_fit, newdata = test_set, type = "response") > 0.5, 1, 0)
+  lr_error <- mean(test_set$state != lr_pred)
+  
+  rf_fit <- randomForest(state ~ ., data = train_set)
+
+  rf_pred <- predict(rf, newdata = test_set)
+  rf_error <- mean(test_set$state != rf_pred)
+  c(lr_error, rf_error)
+  })
+
+rownames(error_rates) <- c("lr", "rf")
+error_rates <- as.data.frame(t(error_rates))
+
+error_rates <- error_rates %>%
+  mutate(fold = 1:n()) %>%
+  gather(model, error, -fold)
+
+error_rates %>%
+  kable("html")
+```
+
+We can plot the error rates for each fold ofr each model as follows
+
+```{r dot_plot}
+dotplot(error ~ model, data = error_rates, ylab = "Mean Prediction Error")
+```
+
+Now to hypothesis test...
+
+```{r h_test}
+lm(error ~ model, data = error_rates) %>% 
+  tidy() %>%
+  kable()
+```
+
+There is not a statistically significant difference between the 2 models.
+
+But again, this is contrived. randomForest on 30% of the projects dataset has an error rate of ~0.4%
+
 #Conclusion
 
-Sometimes it is difficult to spot connections using EDA that machine learning models can learn easily. In our case, a random forest was able to classify the training set very accurately. There are other considerations of machine learning that are not addressed in this tutorial (such as bias). For more information on machine learning see [this text](http://ciml.info/). The concepts illustrated in this tutorial can be adapted to almost any dataset. To answer our initial question, yes, we can (pretty accurately) predict the success or failure of a Kickstarter project given certain factors such as goal and duration.
+Sometimes it is difficult to spot connections using EDA that machine learning models can learn easily. In our case, a random forest was able to classify the training set fairly accurately. There are other considerations of machine learning that are not addressed in this tutorial (such as bias). For more information on machine learning see [this text](http://ciml.info/). The concepts illustrated in this tutorial can be adapted to almost any dataset. To answer our initial question: Yes, we can (fairly accurately) predict the success or failure of a Kickstarter project given certain factors such as goal and duration. Now you can go start your own, just make sure you will reach your goal!
+
+##randomForest30
+
+Below we illustrate just how well a random forest can perform for us...
+
+```{r}
+set.seed(1234)
+
+subset2 <- projects %>%
+  sample_frac(.3)
+
+test_random_forest_df2 <- subset2 %>%
+  group_by(state) %>%
+  sample_frac(.2) %>%
+  ungroup()
+
+train_random_forest_df2 <- subset2 %>%
+  anti_join(test_random_forest_df2, by = "ID")
+
+rf2 <- randomForest(state ~ ., 
+                    data = train_random_forest_df2 %>% 
+                      select(-ID, -name, -category, -deadline, -launched))
+
+rf2
+
+test_predictions2 <- predict(rf2, 
+                             newdata = test_random_forest_df2 %>% 
+                               select(-ID, -name, -category, -deadline, -launched))
+
+table(pred = test_predictions2, observed = test_random_forest_df2$state)
+```
+
